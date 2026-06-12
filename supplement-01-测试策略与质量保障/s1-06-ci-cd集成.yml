@@ -1,0 +1,284 @@
+# ============================================================
+# S1-06：CI/CD 集成 — GitHub Actions 质量门禁
+# ============================================================
+# 当 Prompt 文件变更时自动触发评估。
+# 质量门禁: 综合得分 ≥ 0.85 才能合并到 main 分支。
+# ============================================================
+
+name: RAG Quality Gate
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'prompts/**'            # Prompt 模板变更
+      - 'src/retrieval/**'      # 检索逻辑变更
+      - 'src/llm/**'            # LLM 调用逻辑变更
+      - 'config/model_config.*' # 模型配置变更
+  push:
+    branches: [main]
+    paths:
+      - 'prompts/**'
+
+env:
+  PYTHON_VERSION: '3.11'
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+jobs:
+
+  # ==========================================
+  # 阶段1：代码质量检查
+  # ==========================================
+  lint-and-type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install ruff mypy
+          pip install -r requirements.txt
+
+      - name: Lint with Ruff
+        run: ruff check src/ tests/
+
+      - name: Type check with MyPy
+        run: mypy src/ --ignore-missing-imports
+
+  # ==========================================
+  # 阶段2：单元测试
+  # ==========================================
+  unit-tests:
+    runs-on: ubuntu-latest
+    needs: lint-and-type-check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install pytest pytest-cov pytest-xdist
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ \
+            --cov=src/ \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-fail-under=80 \
+            -n auto \
+            -v
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: htmlcov/
+
+  # ==========================================
+  # 阶段3：RAG 管道测试（检索+生成）
+  # ==========================================
+  rag-pipeline-tests:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+
+      - name: Retrieval Quality Test
+        run: |
+          python -m pytest tests/rag/test_retrieval.py -v \
+            --junitxml=results/retrieval-results.xml
+        env:
+          RETRIEVAL_HIT_RATE_THRESHOLD: "0.85"
+          RETRIEVAL_MRR_THRESHOLD: "0.70"
+
+      - name: Generation Faithfulness Test
+        run: |
+          python -m pytest tests/rag/test_faithfulness.py -v \
+            --junitxml=results/faithfulness-results.xml
+        env:
+          FAITHFULNESS_THRESHOLD: "0.90"
+
+      - name: Property-Based Tests
+        run: |
+          python -m pytest tests/rag/test_properties.py -v \
+            --junitxml=results/property-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rag-test-results
+          path: results/
+
+  # ==========================================
+  # 阶段4：Prompt 回归测试（质量门禁核心）
+  # ==========================================
+  prompt-regression:
+    runs-on: ubuntu-latest
+    needs: rag-pipeline-tests
+    if: |
+      contains(github.event.head_commit.modified, 'prompts/') ||
+      contains(github.event.head_commit.modified, 'config/model_config.')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 需要 git history 获取基线
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install numpy scipy
+
+      - name: Run Prompt Regression Test
+        id: regression
+        run: |
+          python tests/ci/run_prompt_regression.py \
+            --test-set tests/data/prompt_test_cases.json \
+            --baseline-ref origin/main \
+            --output results/regression-report.json \
+            --threshold 0.95
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Check Quality Gate
+        run: |
+          OVERALL_SCORE=$(python -c "
+          import json
+          with open('results/regression-report.json') as f:
+              report = json.load(f)
+          print(report['new_version_score'])
+          ")
+
+          echo "Overall Score: $OVERALL_SCORE"
+
+          THRESHOLD=0.85
+          if (( $(echo "$OVERALL_SCORE < $THRESHOLD" | bc -l) )); then
+            echo "========================================="
+            echo "❌ 质量门禁未通过！"
+            echo "   综合得分: $OVERALL_SCORE"
+            echo "   门禁阈值: $THRESHOLD"
+            echo "========================================="
+            exit 1
+          else
+            echo "========================================="
+            echo "✅ 质量门禁通过！"
+            echo "   综合得分: $OVERALL_SCORE"
+            echo "========================================="
+          fi
+
+      - name: Post Regression Report Comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(
+              fs.readFileSync('results/regression-report.json', 'utf8')
+            );
+
+            const body = `## 📊 Prompt 回归测试报告
+
+            | 指标 | 基线 | 新版本 | 变化 |
+            |------|------|--------|------|
+            | 综合得分 | ${report.baseline_score.toFixed(4)} | ${report.new_version_score.toFixed(4)} | ${report.score_change_pct > 0 ? '+' : ''}${report.score_change_pct.toFixed(2)}% |
+            | 改进用例 | - | ${report.improved_cases} | - |
+            | 退化用例 | - | ${report.degraded_cases} | - |
+            | 门禁结果 | - | ${report.overall_pass ? '✅ 通过' : '❌ 未通过'} | - |
+
+            ${report.recommendation}
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ==========================================
+  # 阶段5：Agent 轨迹测试
+  # ==========================================
+  agent-trajectory-test:
+    runs-on: ubuntu-latest
+    needs: rag-pipeline-tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Agent Trajectory Tests
+        run: |
+          python -m pytest tests/agent/test_trajectories.py -v \
+            --tb=short
+
+  # ==========================================
+  # 阶段6：全面质量门禁汇总
+  # ==========================================
+  quality-gate-summary:
+    runs-on: ubuntu-latest
+    needs:
+      - lint-and-type-check
+      - unit-tests
+      - rag-pipeline-tests
+      - prompt-regression
+      - agent-trajectory-test
+    if: always()
+    steps:
+      - name: Summary
+        run: |
+          echo "========================================="
+          echo "         质量门禁检查清单"
+          echo "========================================="
+          echo ""
+
+          declare -A RESULTS
+          RESULTS[lint]="${{ needs.lint-and-type-check.result }}"
+          RESULTS[unit]="${{ needs.unit-tests.result }}"
+          RESULTS[rag]="${{ needs.rag-pipeline-tests.result }}"
+          RESULTS[prompt]="${{ needs.prompt-regression.result }}"
+          RESULTS[agent]="${{ needs.agent-trajectory-test.result }}"
+
+          ALL_PASSED=true
+
+          for stage in lint unit rag prompt agent; do
+            result="${RESULTS[$stage]}"
+            if [ "$result" == "success" ]; then
+              echo "  ✅ $stage: PASSED"
+            elif [ "$result" == "skipped" ]; then
+              echo "  ⏭️  $stage: SKIPPED"
+            else
+              echo "  ❌ $stage: FAILED"
+              ALL_PASSED=false
+            fi
+          done
+
+          echo ""
+          if [ "$ALL_PASSED" == "true" ]; then
+            echo "  🎉 所有质量门禁通过！"
+          else
+            echo "  💥 质量门禁未通过，请修复后重新提交。"
+            exit 1
+          fi
